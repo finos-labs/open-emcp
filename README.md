@@ -1,8 +1,8 @@
 ![badge-labs](https://user-images.githubusercontent.com/327285/230928932-7c75f8ed-e57b-41db-9fb7-a292a13a1e58.svg)
 
-# Open EMCP
+# OpenEMCP
 
-Short blurb about what your project does.
+Enterprise Multi-agent Communication & Orchestration Protocol.
 
 ## Installation
 
