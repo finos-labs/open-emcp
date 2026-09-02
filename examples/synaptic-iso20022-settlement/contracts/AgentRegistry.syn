@@ -1,0 +1,378 @@
+// Copyright 2026 Synaptics-Lab
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+contract AgentRegistry {
+    state owner: Address;
+    state admin: Address;
+    state paused: bool;
+    state identity_nft: Address;
+
+    state agents_registered: Map<Address, bool>;
+    state agents_active: Map<Address, bool>;
+    state agents_pubkey: Map<Address, String>;
+    state agents_daily_limit: Map<Address, u128>;
+    state agents_max_tx: Map<Address, u128>;
+    state agents_daily_spent: Map<Address, u128>;
+    state agents_spending_day: Map<Address, u64>;
+    state authorized_settlers: Map<Address, bool>;
+
+    // AgentPolicy v2 fields
+    state agents_merchant_allowlist: Map<Address, Map<Address, bool>>;
+    state agents_merchant_max_tx: Map<Address, Map<Address, u128>>;
+    state agents_revocation_time: Map<Address, u64>;
+    state agents_policy_version: Map<Address, u64>;
+
+    event AgentRegistered { agent: Address, admin: Address, pubkey: String, daily_limit: u128, max_tx: u128 }
+    event AgentDeregistered { agent: Address }
+    event AdminChanged { old_admin: Address, new_admin: Address }
+    event IdentityNftChanged { old_nft: Address, new_nft: Address }
+    event SettlerAuthorized { settler: Address }
+    event SettlerRevoked { settler: Address }
+    event PaymentRecorded { agent: Address, amount: u128, day: u64, daily_spent: u128 }
+    event AgentPolicyUpdated { agent: Address, daily_limit: u128, max_tx: u128, policy_version: u64 }
+    event AgentMerchantAllowlistUpdated { agent: Address, merchant: Address, allowed: bool }
+    event AgentMerchantMaxTxUpdated { agent: Address, merchant: Address, max_tx: u128 }
+    event Paused {}
+    event Unpaused {}
+
+    #[writes(owner)]
+    #[writes(admin)]
+    #[writes(paused)]
+    pub fn init() {
+        self.owner = msg.sender;
+        self.admin = msg.sender;
+        self.paused = false;
+    }
+
+    #[reads(owner)]
+    #[reads(admin)]
+    #[writes(admin)]
+    pub fn set_admin(new_admin: Address) {
+        require!(msg.sender == self.owner, "Only owner can set admin");
+        require!(new_admin != Address::zero(), "Invalid admin address");
+        let old_admin = self.admin;
+        self.admin = new_admin;
+        emit AdminChanged { old_admin: old_admin, new_admin: new_admin };
+    }
+
+    #[reads(owner)]
+    #[reads(identity_nft)]
+    #[writes(identity_nft)]
+    pub fn set_identity_nft(new_nft: Address) {
+        require!(msg.sender == self.owner, "Only owner can set identity nft");
+        require!(new_nft != Address::zero(), "Invalid identity nft address");
+        let old_nft = self.identity_nft;
+        self.identity_nft = new_nft;
+        emit IdentityNftChanged { old_nft: old_nft, new_nft: new_nft };
+    }
+
+    #[reads(owner)]
+    #[writes(authorized_settlers)]
+    pub fn authorize_settler(settler: Address) {
+        require!(msg.sender == self.owner, "Only owner can authorize settler");
+        require!(settler != Address::zero(), "Invalid settler address");
+        self.authorized_settlers[settler] = true;
+        emit SettlerAuthorized { settler: settler };
+    }
+
+    #[reads(owner)]
+    #[writes(authorized_settlers)]
+    pub fn revoke_settler(settler: Address) {
+        require!(msg.sender == self.owner, "Only owner can revoke settler");
+        self.authorized_settlers[settler] = false;
+        emit SettlerRevoked { settler: settler };
+    }
+
+    #[reads(owner)]
+    #[reads(admin)]
+    #[reads(paused)]
+    #[writes(paused)]
+    pub fn set_paused(new_paused: bool) {
+        require!(msg.sender == self.owner || msg.sender == self.admin, "Only owner or admin");
+        self.paused = new_paused;
+        if new_paused {
+            emit Paused {};
+        } else {
+            emit Unpaused {};
+        }
+    }
+
+    #[reads(admin)]
+    #[reads(paused)]
+    #[reads(identity_nft)]
+    #[writes(agents_registered)]
+    #[writes(agents_active)]
+    #[writes(agents_pubkey)]
+    #[writes(agents_daily_limit)]
+    #[writes(agents_max_tx)]
+    #[writes(agents_revocation_time)]
+    #[writes(agents_policy_version)]
+    pub fn register_agent(agent: Address, agent_admin: Address, pubkey: String, daily_limit: u128, max_tx: u128) {
+        require!(self.paused == false, "Registry is paused");
+        require!(msg.sender == self.admin, "Only admin can register agents");
+        require!(agent != Address::zero(), "Invalid agent address");
+        require!(daily_limit > 0, "Daily limit must be positive");
+        require!(max_tx > 0, "Max tx must be positive");
+        require!(max_tx <= daily_limit, "Max tx cannot exceed daily limit");
+
+        let token_id = call_contract(self.identity_nft, "token_id_of", [agent]) as u64;
+        require!(token_id != 0, "Agent does not hold an identity NFT");
+
+        self.agents_registered[agent] = true;
+        self.agents_active[agent] = true;
+        self.agents_pubkey[agent] = pubkey;
+        self.agents_daily_limit[agent] = daily_limit;
+        self.agents_max_tx[agent] = max_tx;
+        self.agents_revocation_time[agent] = 0 as u64;
+        self.agents_policy_version[agent] = 1 as u64;
+
+        emit AgentRegistered {
+            agent: agent,
+            admin: agent_admin,
+            pubkey: pubkey,
+            daily_limit: daily_limit,
+            max_tx: max_tx
+        };
+    }
+
+    #[reads(admin)]
+    #[reads(paused)]
+    #[reads(agents_registered)]
+    #[reads(agents_policy_version)]
+    #[writes(agents_daily_limit)]
+    #[writes(agents_max_tx)]
+    #[writes(agents_policy_version)]
+    pub fn update_agent_policy(agent: Address, daily_limit: u128, max_tx: u128) {
+        require!(self.paused == false, "Registry is paused");
+        require!(msg.sender == self.admin, "Only admin can update policy");
+        require!(self.agents_registered[agent] == true, "Agent not registered");
+        require!(daily_limit > 0, "Daily limit must be positive");
+        require!(max_tx > 0, "Max tx must be positive");
+        require!(max_tx <= daily_limit, "Max tx cannot exceed daily limit");
+
+        self.agents_daily_limit[agent] = daily_limit;
+        self.agents_max_tx[agent] = max_tx;
+        let new_version = self.agents_policy_version[agent] + (1 as u64);
+        self.agents_policy_version[agent] = new_version;
+
+        emit AgentPolicyUpdated {
+            agent: agent,
+            daily_limit: daily_limit,
+            max_tx: max_tx,
+            policy_version: new_version
+        };
+    }
+
+    #[reads(admin)]
+    #[reads(paused)]
+    #[reads(agents_registered)]
+    #[writes(agents_merchant_allowlist)]
+    pub fn set_agent_merchant_allowlist(agent: Address, merchant: Address, allowed: bool) {
+        require!(self.paused == false, "Registry is paused");
+        require!(msg.sender == self.admin, "Only admin can set allowlist");
+        require!(self.agents_registered[agent] == true, "Agent not registered");
+        require!(merchant != Address::zero(), "Invalid merchant address");
+
+        self.agents_merchant_allowlist[agent][merchant] = allowed;
+        emit AgentMerchantAllowlistUpdated { agent: agent, merchant: merchant, allowed: allowed };
+    }
+
+    #[reads(admin)]
+    #[reads(paused)]
+    #[reads(agents_registered)]
+    #[reads(agents_daily_limit)]
+    #[writes(agents_merchant_max_tx)]
+    pub fn set_agent_merchant_max_tx(agent: Address, merchant: Address, max_tx: u128) {
+        require!(self.paused == false, "Registry is paused");
+        require!(msg.sender == self.admin, "Only admin can set merchant max_tx");
+        require!(self.agents_registered[agent] == true, "Agent not registered");
+        require!(merchant != Address::zero(), "Invalid merchant address");
+        require!(max_tx > 0, "Max tx must be positive");
+        require!(max_tx <= self.agents_daily_limit[agent], "Merchant max_tx cannot exceed daily limit");
+
+        self.agents_merchant_max_tx[agent][merchant] = max_tx;
+        emit AgentMerchantMaxTxUpdated { agent: agent, merchant: merchant, max_tx: max_tx };
+    }
+
+    #[reads(admin)]
+    #[reads(paused)]
+    #[writes(agents_active)]
+    #[writes(agents_revocation_time)]
+    pub fn deregister_agent(agent: Address) {
+        require!(self.paused == false, "Registry is paused");
+        require!(msg.sender == self.admin, "Only admin can deregister agents");
+        self.agents_active[agent] = false;
+        self.agents_revocation_time[agent] = block_height();
+        emit AgentDeregistered { agent: agent };
+    }
+
+    #[reads(agents_registered)]
+    pub fn is_registered(agent: Address) -> bool {
+        return self.agents_registered[agent];
+    }
+
+    #[reads(agents_active)]
+    #[reads(identity_nft)]
+    pub fn is_agent_active(agent: Address) -> bool {
+        let registered = self.agents_active[agent];
+        let token_id = call_contract(self.identity_nft, "token_id_of", [agent]) as u64;
+        let owns_identity = token_id != 0;
+        return registered && owns_identity;
+    }
+
+    #[reads(agents_daily_limit)]
+    pub fn get_daily_limit(agent: Address) -> u128 {
+        return self.agents_daily_limit[agent];
+    }
+
+    #[reads(agents_max_tx)]
+    pub fn get_max_tx(agent: Address) -> u128 {
+        return self.agents_max_tx[agent];
+    }
+
+    #[reads(agents_daily_limit)]
+    #[reads(agents_daily_spent)]
+    #[reads(agents_spending_day)]
+    pub fn get_remaining_daily_limit(agent: Address) -> u128 {
+        let today = block_height() / (86400 as u64);
+        let same_day = self.agents_spending_day[agent] == today;
+        let mut spent = 0 as u128;
+        if same_day {
+            spent = self.agents_daily_spent[agent];
+        }
+        let limit = self.agents_daily_limit[agent];
+        if spent >= limit {
+            return 0 as u128;
+        }
+        return limit - spent;
+    }
+
+    #[reads(agents_merchant_allowlist)]
+    pub fn is_merchant_allowed(agent: Address, merchant: Address) -> bool {
+        return self.agents_merchant_allowlist[agent][merchant];
+    }
+
+    #[reads(agents_merchant_max_tx)]
+    pub fn get_merchant_max_tx(agent: Address, merchant: Address) -> u128 {
+        return self.agents_merchant_max_tx[agent][merchant];
+    }
+
+    #[reads(agents_revocation_time)]
+    pub fn get_revocation_time(agent: Address) -> u64 {
+        return self.agents_revocation_time[agent];
+    }
+
+    #[reads(agents_policy_version)]
+    pub fn get_policy_version(agent: Address) -> u64 {
+        return self.agents_policy_version[agent];
+    }
+
+    #[reads(agents_active)]
+    #[reads(identity_nft)]
+    #[reads(agents_daily_limit)]
+    #[reads(agents_max_tx)]
+    #[reads(agents_daily_spent)]
+    #[reads(agents_spending_day)]
+    #[reads(authorized_settlers)]
+    #[writes(agents_daily_spent)]
+    #[writes(agents_spending_day)]
+    pub fn record_agent_payment(agent: Address, amount: u128) {
+        require!(self.authorized_settlers[msg.sender] == true, "Only authorized settler");
+        require!(self.agents_active[agent] == true, "Agent not active in registry");
+        let token_id = call_contract(self.identity_nft, "token_id_of", [agent]) as u64;
+        require!(token_id != 0, "Agent does not hold an identity NFT");
+        require!(amount > 0, "Amount must be positive");
+        require!(amount <= self.agents_max_tx[agent], "Amount exceeds max_tx");
+
+        let today = block_height() / (86400 as u64);
+        let same_day = self.agents_spending_day[agent] == today;
+        let mut previous_spent = 0 as u128;
+        if same_day {
+            previous_spent = self.agents_daily_spent[agent];
+        }
+
+        let new_daily = previous_spent + amount;
+        require!(new_daily <= self.agents_daily_limit[agent], "Amount exceeds daily limit");
+        self.agents_spending_day[agent] = today;
+        self.agents_daily_spent[agent] = new_daily;
+
+        emit PaymentRecorded { agent: agent, amount: amount, day: today, daily_spent: new_daily };
+    }
+
+    #[reads(agents_active)]
+    #[reads(identity_nft)]
+    #[reads(agents_daily_limit)]
+    #[reads(agents_max_tx)]
+    #[reads(agents_daily_spent)]
+    #[reads(agents_spending_day)]
+    #[reads(agents_merchant_allowlist)]
+    #[reads(agents_merchant_max_tx)]
+    #[reads(authorized_settlers)]
+    #[writes(agents_daily_spent)]
+    #[writes(agents_spending_day)]
+    pub fn record_agent_payment_to_merchant(agent: Address, merchant: Address, amount: u128) {
+        require!(self.authorized_settlers[msg.sender] == true, "Only authorized settler");
+        require!(self.agents_active[agent] == true, "Agent not active in registry");
+        require!(merchant != Address::zero(), "Invalid merchant address");
+        require!(self.agents_merchant_allowlist[agent][merchant] == true, "Merchant not allowed for agent");
+        let token_id = call_contract(self.identity_nft, "token_id_of", [agent]) as u64;
+        require!(token_id != 0, "Agent does not hold an identity NFT");
+        require!(amount > 0, "Amount must be positive");
+        require!(amount <= self.agents_max_tx[agent], "Amount exceeds agent max_tx");
+
+        let merchant_max = self.agents_merchant_max_tx[agent][merchant];
+        if merchant_max > 0 {
+            require!(amount <= merchant_max, "Amount exceeds merchant max_tx");
+        }
+
+        let today = block_height() / (86400 as u64);
+        let same_day = self.agents_spending_day[agent] == today;
+        let mut previous_spent = 0 as u128;
+        if same_day {
+            previous_spent = self.agents_daily_spent[agent];
+        }
+
+        let new_daily = previous_spent + amount;
+        require!(new_daily <= self.agents_daily_limit[agent], "Amount exceeds daily limit");
+        self.agents_spending_day[agent] = today;
+        self.agents_daily_spent[agent] = new_daily;
+
+        emit PaymentRecorded { agent: agent, amount: amount, day: today, daily_spent: new_daily };
+    }
+
+    #[reads(authorized_settlers)]
+    pub fn is_authorized_settler(settler: Address) -> bool {
+        return self.authorized_settlers[settler];
+    }
+
+    #[reads(owner)]
+    pub fn get_owner() -> Address {
+        return self.owner;
+    }
+
+    #[reads(admin)]
+    pub fn get_admin() -> Address {
+        return self.admin;
+    }
+
+    #[reads(identity_nft)]
+    pub fn get_identity_nft() -> Address {
+        return self.identity_nft;
+    }
+
+    #[reads(paused)]
+    pub fn is_paused() -> bool {
+        return self.paused;
+    }
+}

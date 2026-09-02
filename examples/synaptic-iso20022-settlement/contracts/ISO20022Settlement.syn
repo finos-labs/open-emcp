@@ -1,0 +1,86 @@
+// Copyright 2026 Synaptics-Lab
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+/// SynapticChain ISO 20022 Settlement & Audit Anchoring Engine
+/// Records pacs.008 customer credit transfers and issues immutable pacs.002 settlement receipts.
+contract ISO20022Settlement {
+    state owner: Address;
+    state agent_registry: Address;
+    state paused: bool;
+    state total_settled_volume: u128;
+    state settlement_count: u64;
+
+    // Mapping: Message ID String -> Settlement Record
+    state settlements_executed: Map<String, bool>;
+    state settlements_status: Map<String, u64>; // 1 = ACCP (Accepted), 2 = RJCT (Rejected)
+    state settlements_amount: Map<String, u128>;
+    state settlements_debtor: Map<String, Address>;
+    state settlements_creditor: Map<String, Address>;
+    state settlements_timestamp: Map<String, u64>;
+
+    event Pacs008Initiated { message_id: String, debtor: Address, creditor: Address, amount: u128, currency: String }
+    event Pacs002Settled { message_id: String, status: u64, reason_code: String, block_height: u64 }
+    event Pacs002Rejected { message_id: String, status: u64, reason_code: String }
+
+    #[writes(owner)]
+    #[writes(agent_registry)]
+    #[writes(paused)]
+    #[writes(total_settled_volume)]
+    #[writes(settlement_count)]
+    pub fn init(registry: Address) {
+        self.owner = msg.sender;
+        self.agent_registry = registry;
+        self.paused = false;
+        self.total_settled_volume = 0;
+        self.settlement_count = 0;
+    }
+
+    #[reads(paused)]
+    #[reads(settlements_executed)]
+    #[reads(total_settled_volume)]
+    #[reads(settlement_count)]
+    #[writes(settlements_executed)]
+    #[writes(settlements_status)]
+    #[writes(settlements_amount)]
+    #[writes(settlements_debtor)]
+    #[writes(settlements_creditor)]
+    #[writes(settlements_timestamp)]
+    #[writes(total_settled_volume)]
+    #[writes(settlement_count)]
+    pub fn execute_pacs008(
+        message_id: String,
+        debtor: Address,
+        creditor: Address,
+        amount: u128,
+        currency: String,
+        timestamp: u64
+    ) {
+        require!(!self.paused, "Settlement engine paused");
+        require!(!self.settlements_executed[message_id], "Duplicate pacs.008 message ID");
+        require!(amount > 0, "Zero amount settlement disallowed");
+        require!(debtor != Address::zero() && creditor != Address::zero(), "Invalid parties");
+
+        self.settlements_executed[message_id] = true;
+        self.settlements_status[message_id] = 1; // ACCP
+        self.settlements_amount[message_id] = amount;
+        self.settlements_debtor[message_id] = debtor;
+        self.settlements_creditor[message_id] = creditor;
+        self.settlements_timestamp[message_id] = timestamp;
+        self.total_settled_volume = self.total_settled_volume + amount;
+        self.settlement_count = self.settlement_count + 1;
+
+        emit Pacs008Initiated { message_id: message_id, debtor: debtor, creditor: creditor, amount: amount, currency: currency };
+        emit Pacs002Settled { message_id: message_id, status: 1, reason_code: "ACTC/SETTLED", block_height: self.settlement_count };
+    }
+}
